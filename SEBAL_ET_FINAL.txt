@@ -1,0 +1,539 @@
+
+// FINAL SEBAL MONTHLY ET ESTIMATION
+// LANDSAT 8 ONLY + GAP FILLING VERSION
+// CLEANED EXPORT VERSION
+// ======================================================
+// 1) LOAD DATA
+// LOAD PATCHES
+// ======================================================
+
+var table = ee.FeatureCollection(
+'projects/ee-my-priyangan/assets/Eppawala_multilayer'
+);
+
+var patches = ee.FeatureCollection(
+'users/Priyangan0012/ET_Patches_2024'
+);
+
+// ENTIRE BUFFER AREA
+var studyArea = table.geometry();
+
+Map.centerObject(studyArea,11);
+
+Map.addLayer(
+table,
+{color:'yellow'},
+'Study Area Buffer'
+);
+
+Map.addLayer(
+patches,
+{color:'red'},
+'ET Patches'
+);
+
+// ADD PATCH ID
+
+var patchList = patches.toList(patches.size());
+
+patches = ee.FeatureCollection(
+  ee.List.sequence(0, patches.size().subtract(1))
+    .map(function(i){
+
+      var feature = ee.Feature(
+        patchList.get(i)
+      );
+
+      return feature.set(
+        'PatchID',
+        ee.Number(i).add(1)
+      );
+
+    })
+);
+
+print('Patch IDs Added', patches.limit(5));
+
+// 2) CLOUD MASK FUNCTION
+
+function maskL8L2(img) {
+
+  var qa = img.select('QA_PIXEL');
+
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 0).eq(0));
+
+  var sr = img.select([
+      'SR_B2',
+      'SR_B3',
+      'SR_B4',
+      'SR_B5',
+      'SR_B6',
+      'SR_B7'
+    ])
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  return img
+    .addBands(sr, null, true)
+    .updateMask(mask)
+    .copyProperties(img, ['system:time_start']);
+}
+
+// 3) SURFACE PARAMETERS
+
+function addSurfaceParams(image) {
+
+  // NDVI
+  var ndvi = image.normalizedDifference(
+    ['SR_B5', 'SR_B4']
+  ).rename('NDVI');
+
+  // ALBEDO
+  var albedo = image.expression(
+    '-0.0015 + 0.160*B2 + 0.291*B3 + 0.243*B4 + 0.116*B5 + 0.112*B6 + 0.081*B7',
+    {
+      'B2': image.select('SR_B2'),
+      'B3': image.select('SR_B3'),
+      'B4': image.select('SR_B4'),
+      'B5': image.select('SR_B5'),
+      'B6': image.select('SR_B6'),
+      'B7': image.select('SR_B7')
+    }
+  ).rename('Albedo');
+
+  // LAND SURFACE TEMPERATURE
+  var lst = image.select('ST_B10')
+    .multiply(0.00341802)
+    .add(149.0)
+    .subtract(273.15)
+    .rename('LST');
+
+  return image.addBands([
+    ndvi,
+    albedo,
+    lst
+  ]);
+}
+
+// 4) ERA5 RADIATION
+
+function getERA5Radiation(start, end) {
+
+  var era5 = ee.ImageCollection(
+      'ECMWF/ERA5_LAND/DAILY_AGGR'
+    )
+    .filterDate(start, end)
+    .select(
+      'surface_solar_radiation_downwards_sum'
+    );
+
+  var Rs = era5.mean()
+    .divide(86400)
+    .rename('Rs');
+
+  return Rs;
+}
+
+// 5) NET RADIATION
+
+function addRn(image, Rs) {
+
+  var emissivity = image.select('NDVI')
+    .multiply(0.004)
+    .add(0.986);
+
+  var Ts = image.select('LST').add(273.15);
+
+  var sigma = ee.Image.constant(5.67e-8);
+
+  var Rl_up = Ts.pow(4)
+    .multiply(sigma)
+    .multiply(emissivity);
+
+  var Rl_down = Ts.pow(4)
+    .multiply(sigma)
+    .multiply(0.85);
+
+  var Rn = Rs
+    .multiply(
+      ee.Image.constant(1)
+      .subtract(image.select('Albedo'))
+    )
+    .add(Rl_down)
+    .subtract(Rl_up)
+    .rename('Rn');
+
+  Rn = Rn.max(0);
+
+  return image.addBands(Rn);
+}
+
+// 6) SOIL HEAT FLUX
+
+function addG(image) {
+
+  var G = image.expression(
+
+    'Rn * (0.05 + 0.18 * exp(-0.521 * NDVI))',
+
+    {
+      'Rn': image.select('Rn'),
+      'NDVI': image.select('NDVI')
+    }
+
+  ).rename('G');
+
+  G = G.max(0);
+
+  return image.addBands(G);
+}
+
+// 7) SENSIBLE HEAT FLUX
+
+function addH(image) {
+
+  var lst = image.select('LST');
+
+  var stats = lst.reduceRegion({
+
+    reducer: ee.Reducer.percentile([5,95]),
+
+    geometry: studyArea,
+
+    scale: 60,
+
+    maxPixels: 1e13
+
+  });
+
+  var LSTmin = ee.Number(
+    ee.Algorithms.If(
+      stats.get('LST_p5'),
+      stats.get('LST_p5'),
+      20
+    )
+  );
+
+  var LSTmax = ee.Number(
+    ee.Algorithms.If(
+      stats.get('LST_p95'),
+      stats.get('LST_p95'),
+      40
+    )
+  );
+
+  var dT = lst.subtract(LSTmin)
+    .divide(LSTmax.subtract(LSTmin))
+    .clamp(0,1);
+
+  var H = image.expression(
+  'Rn * (0.7 - 0.5 * NDVI)',
+  {
+    'Rn': image.select('Rn'),
+    'NDVI': image.select('NDVI')
+  }
+).rename('H');
+
+H = H.max(0);
+
+  return image.addBands(H);
+}
+
+// 8) EVAPOTRANSPIRATION
+function addET(image) {
+
+  var Rn = image.select('Rn');
+
+  var G = image.select('G');
+
+  var H = image.select('H');
+
+  var availableEnergy = Rn.subtract(G);
+
+  availableEnergy = availableEnergy.max(0);
+
+  var LE = availableEnergy.subtract(H);
+
+  LE = LE.max(0);
+
+  var EF = LE.divide(
+    availableEnergy.max(1)
+  ).clamp(0,1);
+
+  var ET_daily = EF
+    .multiply(availableEnergy)
+    .multiply(0.035)
+    .clamp(0,8)
+    .rename('ET_daily');
+
+  return image.addBands(ET_daily);
+}
+
+// 9) YEAR SETTINGS
+
+var year = 2024;
+
+var months = ee.List.sequence(1, 12);
+
+// 10) ANNUAL FALLBACK ET IMAGE
+
+var annualStart = ee.Date.fromYMD(year, 1, 1);
+
+var annualEnd = ee.Date.fromYMD(year, 12, 31);
+
+var annualRs = getERA5Radiation(
+  annualStart,
+  annualEnd
+);
+
+var annualCollection = ee.ImageCollection(
+    'LANDSAT/LC08/C02/T1_L2'
+  )
+  .filterBounds(studyArea)
+  .filterDate(annualStart, annualEnd)
+  .filter(ee.Filter.lt('CLOUD_COVER', 50))
+  .map(maskL8L2)
+  .map(addSurfaceParams)
+  .map(function(img) {
+    return addRn(img, annualRs);
+  })
+  .map(addG)
+  .map(addH)
+  .map(addET);
+
+var annualET = annualCollection
+  .select('ET_daily')
+  .median();
+
+// 11) MONTHLY ET ESTIMATION
+
+var monthlyET = ee.ImageCollection.fromImages(
+
+  months.map(function(m) {
+
+    var start = ee.Date.fromYMD(year, m, 1);
+
+    var end = start.advance(1, 'month');
+
+    var Rs = getERA5Radiation(start, end);
+
+    var col = ee.ImageCollection(
+        'LANDSAT/LC08/C02/T1_L2'
+      )
+      .filterBounds(studyArea)
+      .filterDate(start, end)
+      .filter(ee.Filter.lt('CLOUD_COVER', 50))
+      .map(maskL8L2)
+      .map(addSurfaceParams)
+      .map(function(img) {
+        return addRn(img, Rs);
+      })
+      .map(addG)
+      .map(addH)
+      .map(addET);
+
+    var days = end.difference(start, 'day');
+
+    var hasImages = col.size().gt(0);
+
+    var ET_month = ee.Image(
+
+      ee.Algorithms.If(
+
+        hasImages,
+
+        col.select('ET_daily')
+          .mean()
+          .multiply(days),
+
+        annualET.multiply(days)
+
+      )
+
+    );
+
+    ET_month = ET_month.unmask(
+      annualET.multiply(days)
+    );
+
+    ET_month = ET_month.focal_mean({
+
+      radius: 150,
+
+      units: 'meters'
+
+    });
+
+    ET_month = ET_month
+      .clamp(0,180)
+      .max(0)
+      .rename('ET_month');
+
+    return ET_month.set('month', m);
+
+  })
+
+);
+
+// 12) VISUALIZATION
+
+var vis = {
+
+  min: 0,
+
+  max: 150,
+
+  palette: [
+    '#08306b',
+    '#2171b5',
+    '#41ab5d',
+    '#ffff33',
+    '#fd8d3c',
+    '#bd0026'
+  ]
+
+};
+
+var monthNames = [
+
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December'
+
+];
+
+months.evaluate(function(mList) {
+
+  mList.forEach(function(m) {
+
+    var img = monthlyET
+      .filter(ee.Filter.eq('month', m))
+      .first();
+
+    Map.addLayer(
+
+      img.clip(studyArea),
+
+      vis,
+
+      'ET - ' + monthNames[m - 1]
+
+    );
+
+  });
+
+}); 
+
+// PATCH ET EXTRACTION
+
+var ET_patch = monthlyET.map(function(img){
+
+  return img.reduceRegions({
+
+    collection: patches,
+
+    reducer: ee.Reducer.mean(),
+
+    scale: 30
+
+  })
+
+  .map(function(f){
+
+   return f.set({
+
+  'PatchID': f.get('PatchID'),
+
+  'month': img.get('month'),
+
+  'ET': ee.Number(
+    f.get('mean')
+  ).max(0),
+
+  'Zone': f.get('Zone'),
+
+  'Distance': f.get('Distance')
+
+});
+
+  });
+
+}).flatten();
+
+print('Monthly ET Table', ET_patch.limit(20));
+
+months.evaluate(function(mList){
+
+  mList.forEach(function(m){
+
+    var img = monthlyET
+      .filter(ee.Filter.eq('month', m))
+      .first();
+
+    var patchMask = ee.Image.constant(1)
+      .clip(patches)
+      .selfMask();
+
+    var patchET = img.updateMask(patchMask);
+
+    Map.addLayer(
+      patchET,
+      vis,
+      monthNames[m-1] + ' ET - Patches Only'
+    );
+
+  });
+
+});
+
+Map.addLayer(
+patches.style({
+  color:'black',
+  fillColor:'00000000',
+  width:2
+}),
+{},
+'Patch Boundaries'
+);
+
+//print('Total ET Records', ET_patch.size());
+
+//print('ET Table Preview', ET_patch.limit(20));
+
+Export.table.toDrive({
+
+  collection: ET_patch,
+
+  description: 'Monthly_ET_20Patches_2024',
+
+  folder: 'ET_Results',
+
+  fileFormat: 'CSV'
+
+});
+
+
+var jan = monthlyET
+  .filter(ee.Filter.eq('month',1))
+  .first();
+
+print(
+'January Landsat',
+jan.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: studyArea,
+  scale: 30,
+  maxPixels: 1e13
+})
+);

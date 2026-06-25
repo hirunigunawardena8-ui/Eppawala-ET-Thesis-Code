@@ -1,0 +1,218 @@
+
+// MODIS MONTHLY ET
+// FOR 20 PATCHES
+// YEAR 2024
+
+// LOAD STUDY AREA
+
+var table = ee.FeatureCollection(
+'projects/ee-my-priyangan/assets/Eppawala_multilayer'
+);
+
+var patches = ee.FeatureCollection(
+'users/Priyangan0012/ET_Patches_2024'
+);
+
+var studyArea = table.geometry();
+
+Map.centerObject(studyArea,11);
+
+Map.addLayer(
+table,
+{color:'yellow'},
+'Study Area Buffer'
+);
+
+Map.addLayer(
+patches,
+{color:'red'},
+'ET Patches'
+);
+
+var year = 2024;
+
+var months = ee.List.sequence(1,12);
+
+// MODIS ET COLLECTION
+// MOD16A2GF Version 6.1
+
+var modis = ee.ImageCollection(
+'MODIS/061/MOD16A2GF'
+)
+.filterDate(
+'2024-01-01',
+'2025-01-01'
+)
+.select('ET');
+
+// MONTHLY ET IMAGES
+
+var monthlyMODIS = ee.ImageCollection.fromImages(
+
+months.map(function(m){
+
+  var start = ee.Date.fromYMD(year,m,1);
+
+  var end = start.advance(1,'month');
+
+  var monthlyET = modis
+    .filterDate(start,end)
+    .sum()
+    .multiply(0.1)
+    .rename('ET_month');
+
+  return monthlyET
+    .set('month',m);
+
+})
+
+);
+
+// VISUALIZATION
+var vis = {
+
+  min:0,
+  max:150,
+
+  palette:[
+    '#08306b',
+    '#2171b5',
+    '#41ab5d',
+    '#ffff33',
+    '#fd8d3c',
+    '#bd0026'
+  ]
+
+};
+
+var monthNames = [
+
+'January',
+'February',
+'March',
+'April',
+'May',
+'June',
+'July',
+'August',
+'September',
+'October',
+'November',
+'December'
+
+];
+
+// SHOW ALL MONTHS
+
+months.evaluate(function(mList){
+
+  mList.forEach(function(m){
+
+    var img = monthlyMODIS
+      .filter(ee.Filter.eq('month',m))
+      .first();
+
+    Map.addLayer(
+
+      img.clip(studyArea),
+
+      vis,
+
+      'MODIS ET - ' + monthNames[m-1]
+
+    );
+
+  });
+
+});
+
+// EXTRACT PATCH VALUES
+
+var MODIS_ET_Table = monthlyMODIS.map(function(img){
+
+  return img.reduceRegions({
+
+    collection: patches,
+
+    reducer: ee.Reducer.mean(),
+
+    scale: 500,
+
+    tileScale: 4
+
+  })
+
+  .map(function(f){
+
+    return f.set({
+
+      'month': img.get('month'),
+
+      'MODIS_ET': f.get('mean'),
+
+      'Zone': f.get('Zone'),
+
+      'Distance': f.get('Distance')
+
+    });
+
+  });
+
+}).flatten();
+
+print(
+'MODIS ET TABLE',
+MODIS_ET_Table.limit(20)
+);
+
+// EXPORT CSV
+
+Export.table.toDrive({
+
+  collection: MODIS_ET_Table,
+
+  description:'MODIS_ET_20Patches_2024',
+
+  folder:'ET_Results',
+
+  fileFormat:'CSV'
+
+});
+
+var jan = monthlyMODIS
+  .filter(ee.Filter.eq('month',1))
+  .first();
+
+print(
+'January MODIS',
+jan.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: studyArea,
+  scale: 500,
+  maxPixels: 1e13
+})
+);
+
+
+var monthlyMean = monthlyMODIS.map(function(img){
+
+  var mean = img.reduceRegion({
+
+    reducer: ee.Reducer.mean(),
+
+    geometry: studyArea,
+
+    scale: 500,
+
+    maxPixels: 1e13
+
+  });
+
+  return ee.Feature(null,{
+    month: img.get('month'),
+    MeanET: mean.get('ET_month')
+  });
+
+});
+
+print('MODIS Monthly Means', monthlyMean);

@@ -1,0 +1,483 @@
+print(table);
+Map.centerObject(table, 11);
+Map.addLayer(table, {color:'red'}, 'Buffer');
+
+// ======================================
+// STUDY AREA
+
+var studyArea = table.geometry();
+
+Map.centerObject(studyArea, 11);
+
+Map.addLayer(
+    studyArea,
+    {color:'red'},
+    'Study Area'
+);
+
+// CLOUD MASK FUNCTION
+// ======================================
+
+function maskL8(image){
+
+  var qa = image.select('QA_PIXEL');
+
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)
+      .and(qa.bitwiseAnd(1 << 4).eq(0));
+
+  var optical = image.select([
+    'SR_B2',
+    'SR_B3',
+    'SR_B4',
+    'SR_B5',
+    'SR_B6',
+    'SR_B7'
+  ])
+  .multiply(0.0000275)
+  .add(-0.2);
+
+  return image
+    .addBands(optical,null,true)
+    .updateMask(mask);
+}
+
+// LANDSAT 2024
+
+var landsat = ee.ImageCollection(
+'LANDSAT/LC08/C02/T1_L2'
+)
+.filterBounds(studyArea)
+.filterDate('2024-01-01','2024-12-31')
+.filter(ee.Filter.lt('CLOUD_COVER',20))
+.map(maskL8);
+
+// ======================================
+// COMPOSITE
+var image = landsat
+  .median()
+  .clip(studyArea);
+  
+// RGB
+Map.addLayer(
+image,
+{
+bands:['SR_B4','SR_B3','SR_B2'],
+min:0,
+max:0.3
+},
+'RGB'
+);
+
+// NDVI
+
+var ndvi = image.normalizedDifference(
+['SR_B5','SR_B4']
+).rename('NDVI');
+
+Map.addLayer(
+ndvi,
+{
+min:0,
+max:1,
+palette:[
+'brown',
+'yellow',
+'green'
+]
+},
+'NDVI'
+);
+
+// EVI
+
+var nir  = image.select('SR_B5');
+var red  = image.select('SR_B4');
+var blue = image.select('SR_B2');
+
+var evi = nir.subtract(red)
+  .multiply(2.5)
+  .divide(
+    nir.add(red.multiply(6))
+       .subtract(blue.multiply(7.5))
+       .add(1)
+  )
+  .rename('EVI');
+
+// SAVI
+
+var L = 0.5;
+
+var savi = nir.subtract(red)
+  .multiply(1 + L)
+  .divide(
+    nir.add(red).add(L)
+  )
+  .rename('SAVI');
+
+// IMAGE FOR CLASSIFICATION
+
+var imageClass = image.addBands([
+  ndvi,
+  evi,
+  savi
+]);
+
+// ASSIGN CLASS VALUES
+
+waterarea = waterarea.map(function(f){
+  return f.set('class',0);
+});
+
+forest = forest.map(function(f){
+  return f.set('class',1);
+});
+
+cropland = cropland.map(function(f){
+  return f.set('class',2);
+});
+
+bareland_buildings = bareland_buildings.map(function(f){
+  return f.set('class',3);
+});
+
+// MERGE TRAINING DATA
+
+var training = waterarea
+  .merge(forest)
+  .merge(cropland)
+  .merge(bareland_buildings);
+
+print('Training Sample', training.first());
+
+// BANDS
+
+var bands = [
+  'SR_B2',
+  'SR_B3',
+  'SR_B4',
+  'SR_B5',
+  'SR_B6',
+  'SR_B7',
+  'NDVI',
+  'EVI',
+  'SAVI'
+];
+
+// SAMPLE PIXELS
+
+var samples = imageClass
+.select(bands)
+.sampleRegions({
+  collection: training,
+  properties:['class'],
+  scale:30,
+  tileScale:4
+});
+
+print('Total Samples', samples.size());
+
+// 60% TRAIN
+// 20% VALIDATION
+// 20% TEST
+
+var data = samples.randomColumn('random',42);
+
+var trainSet = data.filter(
+  ee.Filter.lt('random',0.6)
+);
+
+var valSet = data
+  .filter(ee.Filter.gte('random',0.6))
+  .filter(ee.Filter.lt('random',0.8));
+
+var testSet = data.filter(
+  ee.Filter.gte('random',0.8)
+);
+
+print('Training Samples', trainSet.size());
+print('Validation Samples', valSet.size());
+print('Testing Samples', testSet.size());
+
+// RANDOM FOREST
+
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees:500,
+  seed:42,
+  bagFraction:0.7
+}).train({
+  features:trainSet,
+  classProperty:'class',
+  inputProperties:bands
+});
+
+// CLASSIFICATION
+
+var classified = imageClass
+.select(bands)
+.classify(classifier);
+
+Map.addLayer(
+classified,
+{
+  min:0,
+  max:3,
+  palette:[
+    '0000FF', // Water
+    '006400', // Forest
+    '00FF00', // Cropland
+    'FF0000'  // Bareland/Built-up
+  ]
+},
+'RF Classification'
+);
+
+// VALIDATION
+
+var valPred = valSet.classify(classifier);
+
+var cmVal = valPred.errorMatrix(
+'class',
+'classification'
+);
+
+print('VALIDATION CM', cmVal);
+print('VALIDATION OA', cmVal.accuracy());
+print('VALIDATION KAPPA', cmVal.kappa());
+
+// TEST
+
+var testPred = testSet.classify(classifier);
+
+var cmTest = testPred.errorMatrix(
+'class',
+'classification'
+);
+
+print('TEST CM', cmTest);
+print('TEST OA', cmTest.accuracy());
+print('TEST KAPPA', cmTest.kappa());
+
+// CROPLAND ONLY
+
+var croplandMask = classified.eq(2);
+
+Map.addLayer(
+croplandMask.selfMask(),
+{
+  palette:['yellow']
+},
+'Cropland Only'
+);
+
+// DISTANCE RINGS
+
+var b3 = table.filter(ee.Filter.eq('distance',3000))
+              .geometry();
+
+var b6 = table.filter(ee.Filter.eq('distance',6000))
+              .geometry();
+
+var b9 = table.filter(ee.Filter.eq('distance',9000))
+              .geometry();
+
+var b12 = table.filter(ee.Filter.eq('distance',12000))
+               .geometry();
+
+var ring0_3 = b3;
+
+var ring3_6 = b6.difference(b3,1);
+
+var ring6_9 = b9.difference(b6,1);
+
+var ring9_12 = b12.difference(b9,1);
+
+// CROPLAND MASK
+
+var cropMask = classified.eq(2).selfMask();
+
+// FUNCTION TO GET 5 PATCHES
+
+function getPatches(region,name){
+
+  var region3857 =
+      region.transform('EPSG:3857',1);
+
+  var grid = region3857.coveringGrid({
+      proj: ee.Projection('EPSG:3857'),
+      scale:500
+  })
+  .map(function(f){
+      return f.transform('EPSG:4326',1);
+  });
+
+  var cropAreaImage =
+      cropMask.multiply(ee.Image.pixelArea());
+
+  var totalAreaImage =
+      ee.Image.pixelArea();
+
+  var gridStats = grid.map(function(cell){
+
+      var cropArea =
+          cropAreaImage.reduceRegion({
+            reducer:ee.Reducer.sum(),
+            geometry:cell.geometry(),
+            scale:30,
+            maxPixels:1e13
+          });
+
+      var totalArea =
+          totalAreaImage.reduceRegion({
+            reducer:ee.Reducer.sum(),
+            geometry:cell.geometry(),
+            scale:30,
+            maxPixels:1e13
+          });
+
+      var cropPercent =
+          ee.Number(cropArea.values().get(0))
+          .divide(
+            ee.Number(totalArea.values().get(0))
+          )
+          .multiply(100);
+
+      return cell.set(
+        'cropPercent',
+        cropPercent
+      );
+
+  });
+
+  var cropDominant =
+      gridStats.filter(
+      ee.Filter.gte(
+      'cropPercent',
+      75
+      ));
+
+  var selected =
+      cropDominant
+      .randomColumn('rand',42)
+      .sort('rand')
+      .limit(5);
+
+  Map.addLayer(
+      selected.style({
+      color:'blue',
+      fillColor:'0000FF44',
+      width:2
+      }),
+      {},
+      name
+  );
+
+  print(name,selected);
+
+  return selected;
+}
+
+// SELECT PATCHES
+
+
+var patches_0_3 =
+    getPatches(
+    ring0_3,
+    '0-3 km patches'
+    );
+
+var patches_3_6 =
+    getPatches(
+    ring3_6,
+    '3-6 km patches'
+    );
+
+var patches_6_9 =
+    getPatches(
+    ring6_9,
+    '6-9 km patches'
+    );
+
+var patches_9_12 =
+    getPatches(
+    ring9_12,
+    '9-12 km patches'
+    );
+
+// MERGE ALL PATCHES
+
+var allPatches =
+patches_0_3
+.merge(patches_3_6)
+.merge(patches_6_9)
+.merge(patches_9_12);
+
+Map.addLayer(
+allPatches,
+{},
+'All Patches'
+);
+
+print(
+'Total Selected Patches',
+allPatches.size()
+);
+
+// PREPARE PATCHES FOR ET ANALYSIS
+
+// 0-3 km
+var patches_0_3_export = patches_0_3.map(function(f){
+  return f.set({
+    'Zone':'0_3',
+    'Distance':'0-3 km'
+  });
+});
+
+// 3-6 km
+var patches_3_6_export = patches_3_6.map(function(f){
+  return f.set({
+    'Zone':'3_6',
+    'Distance':'3-6 km'
+  });
+});
+
+// 6-9 km
+var patches_6_9_export = patches_6_9.map(function(f){
+  return f.set({
+    'Zone':'6_9',
+    'Distance':'6-9 km'
+  });
+});
+
+// 9-12 km
+var patches_9_12_export = patches_9_12.map(function(f){
+  return f.set({
+    'Zone':'9_12',
+    'Distance':'9-12 km'
+  });
+});
+
+// Merge all patches
+var ET_Patches = patches_0_3_export
+  .merge(patches_3_6_export)
+  .merge(patches_6_9_export)
+  .merge(patches_9_12_export);
+
+// Check
+print('ET Patches', ET_Patches);
+print('Total Patches', ET_Patches.size());
+
+Map.addLayer(
+  ET_Patches,
+  {color:'blue'},
+  'ET Patches'
+);
+
+// EXPORT TO ASSET
+// =====================================================
+
+Export.table.toAsset({
+  collection: ET_Patches,
+  description: 'ET_Patches_2024',
+  assetId: 'ET_Patches_2024'
+});
+
