@@ -15,7 +15,7 @@ and trend analysis to characterize spatial and temporal ET patterns.
 
 | File | Description |
 |------|-------------|
-| `classification_final.js` | Land cover classification (Water, Forest, Cropland, Bareland/Built-up) using Landsat 8/9 and Random Forest, with cropland patch selection across distance buffer zones |
+| `classification_final.js` | Land cover classification (Water, Forest, Cropland, Bareland/Built-up) using Landsat 8 and Random Forest, with cropland patch selection across distance buffer zones |
 | `SEBAL_ET_FINAL.js` | Monthly SEBAL evapotranspiration estimation using Landsat 8 surface reflectance, NDVI, albedo, and land surface temperature, with ERA5 radiation data and gap-filling |
 | `MODIS_ET_FINAL.js` | Monthly ET extraction from MODIS MOD16A2GF product for validation against SEBAL estimates |
 | `MANKENDALL_ANALYSIS.js` | Annual ET time series (2013–2025) and Mann-Kendall trend analysis across distance zones |
@@ -24,7 +24,7 @@ and trend analysis to characterize spatial and temporal ET patterns.
 
 - **Classification:** Random Forest (500 trees) using spectral bands + NDVI/EVI/SAVI
 - **ET Model:** SEBAL energy balance (Rn − G − H)
-- **Data Sources:** Landsat 8/9 Collection 2 Level 2, MODIS MOD16A2GF, ERA5-Land
+- **Data Sources:** Landsat 8 Collection 2 Level 2, MODIS MOD16A2GF, ERA5-Land
 - **Validation:** Cross-comparison between SEBAL and MODIS ET products
 - **Trend Analysis:** Mann-Kendall test on annual ET time series by distance zone
 
